@@ -3,11 +3,11 @@
 
 mod time;
 mod uart;
-mod xmodem;
 
 use core::{
     arch::{asm, global_asm},
     fmt::{self, Write},
+    time::Duration,
 };
 use uart::Uart;
 
@@ -83,11 +83,35 @@ unsafe extern "C" fn trap_handler(tf: &mut TrapFrame) -> ! {
     cease();
 }
 
+impl zmodem::SerialDevice for &mut Uart {
+    type Error = uart::UartError;
+
+    fn recv(&mut self, timeout: core::time::Duration) -> Result<Option<u8>, Self::Error> {
+        match self.receive_timeout(timeout) {
+            Ok(byte) => Ok(Some(byte)),
+            Err(uart::UartError::TimedOut) => Ok(None),
+        }
+    }
+
+    fn send(&mut self, byte: u8) -> Result<(), Self::Error> {
+        self.transmit(byte)
+    }
+}
+
 #[no_mangle]
 unsafe extern "C" fn chainload_start() -> ! {
     let mut uart = Uart::new();
     uart.initialize(115200).unwrap();
     uprintln!(uart, "hello, world!");
-    xmodem::receive(&mut uart, 0x40200000 as *mut u8).unwrap();
+
+    let output =
+        unsafe { core::slice::from_raw_parts_mut(0x80000000 as *mut u8, 0x200000000 - 0x40000000) };
+    zmodem::receive(&mut uart, output).unwrap();
+    time::sleep(Duration::from_secs(5));
+
+    uprintln!(uart, "load finished");
+
+    unsafe { asm!("jr {}", in(reg) 0x80000000usize) };
+
     cease();
 }

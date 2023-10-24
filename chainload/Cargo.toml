@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 bitflags = "*"
 bytemuck = { version = "*", features = ["derive"] }
+zmodem = { path = "../zmodem", default-features = false }

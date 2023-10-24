@@ -1,9 +1,0 @@
-[package]
-name = "rsx"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-clap = "4"
-nix = { version = "0.27.1", features = ["term"] }
-bytemuck = { version = "1.9.1", features = ["derive"] }

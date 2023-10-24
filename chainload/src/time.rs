@@ -55,3 +55,10 @@ impl Timeout {
         Instant::now() - self.start >= self.duration
     }
 }
+
+pub fn sleep(duration: Duration) {
+    let timeout = Timeout::start(duration);
+    while !timeout.expired() {
+        core::hint::spin_loop();
+    }
+}
