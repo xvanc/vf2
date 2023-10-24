@@ -12,12 +12,6 @@ pub struct Receiver<D: SerialDevice> {
 }
 
 impl<D: SerialDevice> Receiver<D> {
-    pub fn new(dev: D) -> Receiver<D> {
-        Self {
-            dev: Device { dev },
-        }
-    }
-
     fn send_hex(&mut self, byte: u8) -> Result<(), Error<D::Error>> {
         let bytes = to_hex(byte);
         self.dev.send(bytes[0])?;
@@ -31,29 +25,6 @@ impl<D: SerialDevice> Receiver<D> {
         } else {
             self.dev.send(byte)
         }
-    }
-
-    fn recv_hex(&mut self) -> Result<u8, Error<D::Error>> {
-        Ok(from_hex([
-            self.dev.recv(TIMEOUT_DURATION)?,
-            self.dev.recv(TIMEOUT_DURATION)?,
-        ])?)
-    }
-
-    fn recv(&mut self, hex: bool) -> Result<u8, Error<D::Error>> {
-        if hex {
-            self.recv_hex()
-        } else {
-            self.dev.recv(TIMEOUT_DURATION)
-        }
-    }
-
-    fn recv_any<T: Pod + Zeroable>(&mut self) -> Result<T, Error<D::Error>> {
-        let mut buf = T::zeroed();
-        for byte in bytemuck::bytes_of_mut(&mut buf) {
-            *byte = self.recv(false)?;
-        }
-        Ok(buf)
     }
 
     pub fn send_frame(&mut self, frame: FrameHeader) -> Result<(), Error<D::Error>> {
@@ -93,51 +64,131 @@ impl<D: SerialDevice> Receiver<D> {
     pub fn send_zfin(&mut self) -> Result<(), Error<D::Error>> {
         self.send_frame(FrameHeader::new(FrameEncoding::HEX, FrameType::ZFIN))
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RecvEnc {
+    Hex,
+    Esc,
+    Raw,
+}
+
+impl<D: SerialDevice> Receiver<D> {
+    pub fn new(dev: D) -> Receiver<D> {
+        Self {
+            dev: Device { dev },
+        }
+    }
+
+    /// Receive a raw byte (no unescaping or hex-decoding)
+    fn recv_raw(&mut self, timeout: Duration) -> Result<u8, Error<D::Error>> {
+        self.dev.recv(timeout)
+    }
+
+    /// Receive an unescaped byte.
+    fn recv_esc(&mut self, timeout: Duration) -> Result<u8, Error<D::Error>> {
+        let byte = match self.dev.recv(timeout)? {
+            ZDLE => match self.dev.recv(timeout)? {
+                byte if byte & 0x60 == 0x40 => byte ^ 0x40,
+                ZRUB0 => 0x7f,
+                ZRUB1 => 0xff,
+                byte => panic!("unhandled ZDLE escape: {byte:02x}"),
+            },
+            byte => byte,
+        };
+        Ok(byte)
+    }
+
+    /// Receive a hex-encoded byte
+    fn recv_hex(&mut self, timeout: Duration) -> Result<u8, Error<D::Error>> {
+        // NOTE: Hex-encoding ignores parity.
+        let hi = self.dev.recv(timeout)? & 0x7f;
+        let lo = self.dev.recv(timeout)? & 0x7f;
+        Ok(from_hex([hi, lo])?)
+    }
+
+    /// Receive a byte, decoded according to `enc`
+    fn recv_byte(&mut self, enc: RecvEnc, timeout: Duration) -> Result<u8, Error<D::Error>> {
+        match enc {
+            RecvEnc::Hex => self.recv_hex(timeout),
+            RecvEnc::Esc => self.recv_esc(timeout),
+            RecvEnc::Raw => self.recv_raw(timeout),
+        }
+    }
+
+    fn recv<T: Pod + Zeroable>(
+        &mut self,
+        enc: RecvEnc,
+        timeout: Duration,
+    ) -> Result<T, Error<D::Error>> {
+        let mut buf = T::zeroed();
+        for byte in bytemuck::bytes_of_mut(&mut buf) {
+            *byte = self.recv_byte(enc, timeout)?;
+        }
+        Ok(buf)
+    }
+
+    /// Receive the data portion of a packet.
+    ///
+    /// Returns `None` if the entire buffer is filled, otherwise returns the packet type along
+    /// with the number of bytes written to the buffer.
+    fn receive_data(&mut self, buf: &mut [u8]) -> Result<Option<(u8, usize)>, Error<D::Error>> {
+        let mut i = 0;
+        while i < buf.len() {
+            let byte = match self.dev.recv(TIMEOUT_DURATION)? {
+                ZDLE => match self.dev.recv(TIMEOUT_DURATION)? {
+                    byte if byte & 0x60 == 0x40 => byte ^ 0x40,
+                    ZRUB0 => 0x7f,
+                    ZRUB1 => 0xff,
+                    packet_type @ (ZCRCE | ZCRCG | ZCRCQ | ZCRCW) => {
+                        return Ok(Some((packet_type, i)));
+                    }
+                    byte => panic!("unhandled ZDLE escape: {byte:02x}"),
+                },
+                byte => byte,
+            };
+            buf[i] = byte;
+            i += 1;
+        }
+        Ok(None)
+    }
 
     pub fn receive_data_packet<'buf>(
         &mut self,
         encoding: FrameEncoding,
         buf: &'buf mut [u8],
     ) -> Result<(PacketType, &'buf [u8]), Error<D::Error>> {
-        let mut i = 0;
-        let mut push = |byte| {
-            buf[i] = byte;
-            i += 1;
-        };
-
-        let packet_type = loop {
-            let byte = self.dev.recv(TIMEOUT_DURATION)?;
-            match byte {
-                ZDLE => match self.dev.recv(TIMEOUT_DURATION)? {
-                    packet_type @ (ZCRCE | ZCRCG | ZCRCQ | ZCRCW) => break packet_type,
-                    ZRUB0 => push(0x7f),
-                    ZRUB1 => push(0xff),
-                    byte if byte & 0x60 == 0x40 => push(byte ^ 0x40),
-                    byte => push(byte),
-                },
-                byte => push(byte),
+        let (packet_type, len) = match self.receive_data(&mut buf[..1024])? {
+            Some((packet_type, len)) => (packet_type, len),
+            None => {
+                let byte = self.dev.recv(TIMEOUT_DURATION)?;
+                assert!(byte == ZDLE, "{byte:02x}");
+                (self.dev.recv(TIMEOUT_DURATION)?, 1024)
             }
         };
+        let packet_type = PacketType(packet_type);
 
         let crc = if encoding == FrameEncoding::BIN16 {
-            self.recv_any::<u16>()?.swap_bytes() as u32
+            self.recv::<u16>(RecvEnc::Esc, TIMEOUT_DURATION)?
+                .swap_bytes() as u32
         } else {
-            self.recv_any::<u32>()?.swap_bytes()
+            self.recv::<u32>(RecvEnc::Esc, TIMEOUT_DURATION)?
+                .swap_bytes()
         };
 
-        // println!("data: {i} bytes, {packet_type:?}, crc {crc:#x}",);
+        // println!("data: {len} bytes, {packet_type:?}, crc {crc:#x}",);
 
-        Ok((PacketType(packet_type), &buf[..i]))
+        Ok((packet_type, &buf[..len]))
     }
 
     pub fn receive_frame_header(
         &mut self,
-        timeout: Option<Duration>,
+        timeout: Duration,
     ) -> Result<FrameHeader, Error<D::Error>> {
         let mut prec_zpad = false;
         loop {
-            match self.dev.recv(timeout.unwrap_or(TIMEOUT_DURATION))? {
-                ZPAD => match self.dev.recv(timeout.unwrap_or(TIMEOUT_DURATION))? {
+            match self.recv_raw(timeout)? {
+                ZPAD => match self.recv_raw(timeout)? {
                     ZDLE => break,
                     byte => {
                         prec_zpad = byte == ZPAD;
@@ -149,7 +200,7 @@ impl<D: SerialDevice> Receiver<D> {
             }
         }
 
-        let encoding = FrameEncoding(self.dev.recv(TIMEOUT_DURATION)?);
+        let encoding = FrameEncoding(self.recv_raw(TIMEOUT_DURATION)?);
         if !matches!(
             encoding,
             FrameEncoding::HEX | FrameEncoding::BIN16 | FrameEncoding::BIN32
@@ -157,33 +208,34 @@ impl<D: SerialDevice> Receiver<D> {
             return Err(Error::InvalidFrameEncoding(encoding));
         }
 
-        let hex = encoding == FrameEncoding::HEX;
-        if hex && !prec_zpad {
-            println!("hex frame with single zpad");
-        }
+        let enc = match encoding {
+            FrameEncoding::HEX => {
+                if !prec_zpad {
+                    println!("hex frame with single zpad");
+                }
+                RecvEnc::Hex
+            }
+            _ => RecvEnc::Esc,
+        };
 
-        let frame_type = FrameType(self.recv(hex)?);
-
-        let mut payload = [0; 4];
-        for byte in &mut payload {
-            *byte = self.recv(hex)?;
-        }
+        let frame_type = FrameType(self.recv(enc, TIMEOUT_DURATION)?);
+        let data = self.recv(enc, TIMEOUT_DURATION)?;
 
         let crc = if encoding == FrameEncoding::BIN32 {
             let mut crc = [0; 4];
             for byte in &mut crc {
-                *byte = self.recv(false)?;
+                *byte = self.recv(enc, TIMEOUT_DURATION)?;
             }
             u32::from_le_bytes(crc)
         } else {
             let mut crc = [0; 2];
             for byte in &mut crc {
-                *byte = self.recv(hex)?;
+                *byte = self.recv(enc, TIMEOUT_DURATION)?;
             }
             u16::from_le_bytes(crc) as u32
         };
 
-        if hex {
+        if encoding == FrameEncoding::HEX {
             if self.dev.recv(TIMEOUT_DURATION)? != CR {
                 println!("missing CR on hex frame");
             }
@@ -200,10 +252,10 @@ impl<D: SerialDevice> Receiver<D> {
         let frame = FrameHeader {
             encoding,
             r#type: frame_type,
-            data: payload,
+            data,
         };
 
-        // println!("rx frame: {encoding:?}, {frame_type:?}, {payload:02x?}");
+        // println!("rx frame: {encoding:?}, {frame_type:?}, {data:02x?}");
 
         Ok(frame)
     }
@@ -222,7 +274,7 @@ pub fn receive<D: SerialDevice>(dev: D, output: &mut [u8]) -> Result<usize, Erro
         // Receive the ZFILE header.
         let zfile = loop {
             receiver.send_zrinit()?;
-            let frame = match receiver.receive_frame_header(Some(timeout)) {
+            let frame = match receiver.receive_frame_header(timeout) {
                 Ok(frame) => frame,
                 Err(Error::TimedOut) => continue,
                 Err(error) => return Err(error),
@@ -257,7 +309,7 @@ pub fn receive<D: SerialDevice>(dev: D, output: &mut [u8]) -> Result<usize, Erro
         let mut pos = 0;
         receiver.send_zrpos(pos)?;
         loop {
-            let frame = receiver.receive_frame_header(None)?;
+            let frame = receiver.receive_frame_header(TIMEOUT_DURATION)?;
             match frame.r#type {
                 FrameType::ZDATA => (),
                 FrameType::ZEOF => break,
@@ -282,8 +334,8 @@ pub fn receive<D: SerialDevice>(dev: D, output: &mut [u8]) -> Result<usize, Erro
     }
 
     receiver.send_zfin()?;
-    assert!(receiver.recv(false)? == b'O');
-    assert!(receiver.recv(false)? == b'O');
+    assert!(receiver.recv::<u8>(RecvEnc::Raw, TIMEOUT_DURATION)? == b'O');
+    assert!(receiver.recv::<u8>(RecvEnc::Raw, TIMEOUT_DURATION)? == b'O');
 
     Ok(output_offset)
 }

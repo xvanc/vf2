@@ -52,20 +52,29 @@ pub enum Error<D> {
     Device(D),
 }
 
+// Interal wrapper around `SerialDevice` to translate `None` into our `Error::TimedOut`.
 struct Device<D: SerialDevice> {
     dev: D,
 }
 
 impl<D: SerialDevice> Device<D> {
     fn send(&mut self, byte: u8) -> Result<(), Error<D::Error>> {
+        // println!("tx: {byte:02x} ({:?})", byte as char);
         self.dev.send(byte).map_err(Error::Device)
     }
 
+    #[allow(clippy::let_and_return)]
     fn recv(&mut self, timeout: Duration) -> Result<u8, Error<D::Error>> {
-        self.dev
-            .recv(timeout)
-            .map_err(Error::Device)?
-            .ok_or(Error::TimedOut)
+        let result = match self.dev.recv(timeout) {
+            Ok(Some(byte)) => Ok(byte),
+            Ok(None) => Err(Error::TimedOut),
+            Err(error) => Err(Error::Device(error)),
+        };
+        // match &result {
+        //     Ok(byte) => println!("rx: {byte:02x} ({:?})", *byte as char),
+        //     Err(error) => println!("rx: {error:?}"),
+        // }
+        result
     }
 }
 
