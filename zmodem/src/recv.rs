@@ -1,5 +1,5 @@
 use crate::{
-    crc16, from_hex,
+    crc16, crc32, from_hex,
     proto::{consts::*, FrameEncoding},
     proto::{FrameHeader, FrameType, PacketType},
     to_hex, Device, Error, SerialDevice, TIMEOUT_DURATION,
@@ -29,7 +29,7 @@ impl<D: SerialDevice> Receiver<D> {
 
     pub fn send_frame(&mut self, frame: FrameHeader) -> Result<(), Error<D::Error>> {
         let buf = bytemuck::bytes_of(&frame);
-        let crc = crc16(&buf[1..]);
+        let crc = crc16(&buf[1..], None);
 
         // println!(
         //     "tx frame: {:?}, {:?}, {:02x?}",
@@ -168,13 +168,19 @@ impl<D: SerialDevice> Receiver<D> {
         };
         let packet_type = PacketType(packet_type);
 
-        let crc = if encoding == FrameEncoding::BIN16 {
-            self.recv::<u16>(RecvEnc::Esc, TIMEOUT_DURATION)?
-                .swap_bytes() as u32
+        let (crc, our_crc) = if encoding == FrameEncoding::BIN32 {
+            let crc = u32::from_be_bytes(self.recv(RecvEnc::Esc, TIMEOUT_DURATION)?);
+            let our_crc = crc32(&buf[..len], Some(packet_type.0));
+            (crc, our_crc)
         } else {
-            self.recv::<u32>(RecvEnc::Esc, TIMEOUT_DURATION)?
-                .swap_bytes()
+            let crc = u16::from_be_bytes(self.recv(RecvEnc::Esc, TIMEOUT_DURATION)?) as u32;
+            let our_crc = crc16(&buf[..len], Some(packet_type.0)) as u32;
+            (crc, our_crc)
         };
+
+        if crc != our_crc {
+            println!("packet crc error");
+        }
 
         // println!("data: {len} bytes, {packet_type:?}, crc {crc:#x}",);
 
@@ -221,19 +227,25 @@ impl<D: SerialDevice> Receiver<D> {
         let frame_type = FrameType(self.recv(enc, TIMEOUT_DURATION)?);
         let data = self.recv(enc, TIMEOUT_DURATION)?;
 
-        let crc = if encoding == FrameEncoding::BIN32 {
-            let mut crc = [0; 4];
-            for byte in &mut crc {
-                *byte = self.recv(enc, TIMEOUT_DURATION)?;
-            }
-            u32::from_le_bytes(crc)
-        } else {
-            let mut crc = [0; 2];
-            for byte in &mut crc {
-                *byte = self.recv(enc, TIMEOUT_DURATION)?;
-            }
-            u16::from_le_bytes(crc) as u32
+        let frame = FrameHeader {
+            encoding,
+            r#type: frame_type,
+            data,
         };
+
+        let (crc, our_crc) = if encoding == FrameEncoding::BIN32 {
+            let crc = u32::from_be_bytes(self.recv(enc, TIMEOUT_DURATION)?);
+            let our_crc = crc32(&bytemuck::bytes_of(&frame)[1..], None);
+            (crc, our_crc)
+        } else {
+            let crc = u16::from_be_bytes(self.recv(enc, TIMEOUT_DURATION)?) as u32;
+            let our_crc = crc16(&bytemuck::bytes_of(&frame)[1..], None) as u32;
+            (crc, our_crc)
+        };
+
+        if crc != our_crc {
+            println!("frame crc error");
+        }
 
         if encoding == FrameEncoding::HEX {
             if self.dev.recv(TIMEOUT_DURATION)? != CR {
@@ -248,12 +260,6 @@ impl<D: SerialDevice> Receiver<D> {
                 println!("missing XON on hex frame");
             }
         }
-
-        let frame = FrameHeader {
-            encoding,
-            r#type: frame_type,
-            data,
-        };
 
         // println!("rx frame: {encoding:?}, {frame_type:?}, {data:02x?}");
 

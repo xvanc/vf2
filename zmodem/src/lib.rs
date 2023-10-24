@@ -80,8 +80,24 @@ impl<D: SerialDevice> Device<D> {
 
 const TIMEOUT_DURATION: Duration = Duration::from_secs(600);
 
-pub fn crc16(buf: &[u8]) -> u16 {
-    crc::Crc::<u16>::new(&crc::CRC_16_XMODEM).checksum(buf)
+pub fn crc16(buf: &[u8], frameend: Option<u8>) -> u16 {
+    let crc = crc::Crc::<u16>::new(&crc::CRC_16_XMODEM);
+    let mut digest = crc.digest();
+    digest.update(buf);
+    if let Some(frameend) = frameend {
+        digest.update(&[frameend]);
+    }
+    digest.finalize()
+}
+
+pub fn crc32(buf: &[u8], frameend: Option<u8>) -> u32 {
+    let crc = crc::Crc::<u32>::new(&crc::CRC_32_CKSUM);
+    let mut digest = crc.digest();
+    digest.update(buf);
+    if let Some(frameend) = frameend {
+        digest.update(&[frameend]);
+    }
+    digest.finalize()
 }
 
 pub struct FromHexError(u8);
