@@ -1,7 +1,6 @@
 use crate::{
     crc16, crc32, from_hex,
-    proto::{consts::*, FrameEncoding},
-    proto::{FrameHeader, FrameType, PacketType},
+    proto::{consts::*, FrameEncoding, FrameHeader, FrameType, PacketType},
     to_hex, Device, Error, SerialDevice, TIMEOUT_DURATION,
 };
 use bytemuck::{Pod, Zeroable};
